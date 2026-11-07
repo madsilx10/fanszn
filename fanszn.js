@@ -178,10 +178,10 @@ async function connectX(account) {
         break;
       }
 
-      const resolvedLoc = loc.startsWith("/") ? `https://x.com${loc}` : loc;
+      const resolvedLoc = loc.startsWith("/") ? new URL(loc, currentUrl).href : loc;
 
-      // Kalau redirect sudah ke callback FansZN, langsung pakai
-      if (resolvedLoc.includes("fanszn.ipx.exchange")) {
+      // Kalau redirect ke callback FansZN (harus ada ?code= atau /callback)
+      if (resolvedLoc.includes("fanszn.ipx.exchange") && (resolvedLoc.includes("code=") || resolvedLoc.includes("/callback"))) {
         callbackUrl = resolvedLoc;
         log(`Akun #${index} — langsung dapat callback FansZN!`);
         break;
