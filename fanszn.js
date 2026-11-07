@@ -1,319 +1,204 @@
-const fs = require("fs");
+const fs       = require("fs");
+const https    = require("https");
 const readline = require("readline");
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
-const REF_LINK = "https://fanszn.ipx.exchange/i/FAN-3CVF";
 const ACCTS_FILE = "akun.txt";
-const DELAY_MS = 2000; // jeda antar akun (ms)
-const DEBUG = process.argv.includes("--debug");
+const REF        = "FAN-3CVF";
+const BASE_FANSZN = "fanszn.ipx.exchange";
+const BASE_X      = "x.com";
+const BASE_X_API  = "api.x.com";
+const DELAY_MS    = 3000;
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function log(msg, type = "info") {
   const icons = { info: "·", ok: "✓", err: "✗", warn: "⚠" };
   console.log(`[${icons[type] || "·"}] ${msg}`);
 }
 
-function loadAccounts() {
-  if (!fs.existsSync(ACCTS_FILE)) {
-    console.error(`File ${ACCTS_FILE} tidak ditemukan!`);
-    process.exit(1);
-  }
-
-  const raw = fs.readFileSync(ACCTS_FILE, "utf8");
-
-  // Split per blok (dipisah baris kosong)
-  const blocks = raw
-    .split(/\n\s*\n/)
-    .map((b) => b.trim())
-    .filter(Boolean);
-
-  const accounts = [];
-  for (const block of blocks) {
-    const lines = block.split("\n").map((l) => l.trim()).filter(Boolean);
-    const authToken = lines[0];
-    const ct0 = lines[1];
-    if (authToken && ct0) {
-      accounts.push({ authToken, ct0, index: accounts.length + 1 });
-    }
-  }
-
-  return accounts;
+function request(options, body = null) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(options, (res) => {
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => {
+        const buf = Buffer.concat(chunks);
+        const enc = res.headers["content-encoding"] || "";
+        const decompress = (b) => {
+          if (enc.includes("br"))      return require("zlib").brotliDecompressSync(b);
+          if (enc.includes("gzip"))    return require("zlib").gunzipSync(b);
+          if (enc.includes("deflate")) return require("zlib").inflateSync(b);
+          return b;
+        };
+        let text;
+        try { text = decompress(buf).toString("utf8"); } catch { text = buf.toString("utf8"); }
+        let parsed;
+        try { parsed = JSON.parse(text); } catch { parsed = text; }
+        resolve({ status: res.statusCode, body: parsed, headers: res.headers, raw: text });
+      });
+    });
+    req.on("error", reject);
+    if (body) req.write(body);
+    req.end();
+  });
 }
 
-// ─── DEBUG: PROBE ENDPOINTS ───────────────────────────────────────────────────
-async function probeEndpoints() {
-  const BASE = "https://fanszn.ipx.exchange";
-  const UA = "Mozilla/5.0 (Linux; Android 11; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
+function xHeaders(authToken, ct0, extra = {}) {
+  return {
+    authorization: "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA",
+    cookie: `auth_token=${authToken}; ct0=${ct0}`,
+    "x-csrf-token": ct0,
+    "user-agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+    "x-twitter-active-user": "yes",
+    "x-twitter-client-language": "en",
+    origin: "https://x.com",
+    referer: "https://x.com/",
+    ...extra,
+  };
+}
 
-  // Step 1: Ambil HTML halaman, extract semua _next/static JS chunk URLs
-  console.log("Fetching page HTML...");
-  const pageRes = await fetch(`${BASE}/fanszn/pick`, {
-    headers: { "User-Agent": UA, Accept: "text/html" },
-  });
-  const html = await pageRes.text();
-
-  // Extract semua script src
-  const scriptMatches = [...html.matchAll(/src="([^"]*\.js[^"]*)"/g)];
-  const scriptUrls = scriptMatches
-    .map((m) => m[1])
-    .filter((u) => u.includes("_next") || u.includes("chunk") || u.includes("app") || u.includes("page"))
-    .map((u) => u.startsWith("http") ? u : `${BASE}${u}`);
-
-  console.log(`\nFound ${scriptUrls.length} script(s):\n${scriptUrls.join("\n")}`);
-
-  // Step 2: Download tiap chunk, cari string auth/twitter/signin/oauth
-  console.log("\n══ Scanning JS bundles for auth endpoints ══");
-  const keywords = ["signin", "twitter", "oauth", "auth", "/api/", "callback", "csrf", "token"];
-
-  for (const url of scriptUrls) {
-    try {
-      const r = await fetch(url, { headers: { "User-Agent": UA } });
-      const src = await r.text();
-
-      // Cari semua string yang mirip API path
-      const paths = [...src.matchAll(/["'`](\/[a-zA-Z0-9/_\-\.?=&%]+)["'`]/g)]
-        .map((m) => m[1])
-        .filter((p) => keywords.some((k) => p.toLowerCase().includes(k)));
-
-      if (paths.length) {
-        console.log(`\n[${url.split("/").pop()}]`);
-        // Dedup dan print
-        [...new Set(paths)].slice(0, 30).forEach((p) => console.log(`  ${p}`));
-      }
-    } catch (e) {
-      console.log(`ERR fetching ${url}: ${e.message}`);
-    }
-  }
-  console.log("\n═════════════════════════\n");
+function loadAccounts() {
+  if (!fs.existsSync(ACCTS_FILE)) { console.error(`${ACCTS_FILE} tidak ditemukan!`); process.exit(1); }
+  return fs.readFileSync(ACCTS_FILE, "utf8")
+    .split(/\n\s*\n/).map(b => b.trim()).filter(Boolean)
+    .map((block, i) => {
+      const lines = block.split("\n").map(l => l.trim()).filter(Boolean);
+      return { authToken: lines[0], ct0: lines[1], index: i + 1 };
+    }).filter(a => a.authToken && a.ct0);
 }
 
 // ─── CORE: CONNECT X ──────────────────────────────────────────────────────────
 async function connectX(account) {
   const { authToken, ct0, index } = account;
-  const BASE  = "https://fanszn.ipx.exchange";
-  const UA    = "Mozilla/5.0 (Linux; Android 11; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
-  const REF   = "FAN-3CVF";
-
-  // Cookie jar FansZN session
-  let jar = "";
-
-  const setCookies = (res) => {
-    const raw = res.headers.getSetCookie?.() ||
-      (res.headers.get("set-cookie") ? [res.headers.get("set-cookie")] : []);
-    if (raw.length) jar = mergeCookies(jar, raw.map(c => c.split(";")[0]).join("; "));
-  };
-
   log(`Akun #${index} — mulai...`);
 
   try {
-    // ── Step 1: GET /api/fanszn/auth/x/start → redirect ke Twitter OAuth ─────
-    // URL persis dari fungsi kq() di source: /api/fanszn/auth/x/start?returnTo=...&ref=...
-    const startUrl = `${BASE}/api/fanszn/auth/x/start?returnTo=%2Ffanszn%2Fconnect&ref=${REF}`;
-
-    const startRes = await fetch(startUrl, {
+    // ── Step 1: GET /api/fanszn/auth/x/start → dapat redirect ke Twitter ─────
+    const startRes = await request({
+      hostname: BASE_FANSZN,
+      path: `/api/fanszn/auth/x/start?returnTo=%2Ffanszn%2Fconnect&ref=${REF}`,
       method: "GET",
       headers: {
-        "User-Agent": UA,
-        Accept: "text/html,application/xhtml+xml,*/*",
-        Referer: `${BASE}/fanszn/pick?ref=${REF}`,
-        Cookie: jar,
+        accept: "*/*",
+        "user-agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+        referer: `https://${BASE_FANSZN}/fanszn/pick?ref=${REF}`,
       },
-      redirect: "manual",
     });
 
-    setCookies(startRes);
-
-    let twitterAuthUrl = startRes.headers.get("location");
-
-    if (!twitterAuthUrl) {
-      const body = await startRes.text().catch(() => "");
-      log(`Akun #${index} — start status: ${startRes.status} | body: ${body.slice(0, 300)}`, "warn");
-      throw new Error("Tidak dapat redirect Twitter dari /auth/x/start");
+    // Follow redirect manual (301 twitter.com → x.com)
+    let xAuthUrl = startRes.headers?.location;
+    if (!xAuthUrl) {
+      log(`Akun #${index} — start status: ${startRes.status} | ${JSON.stringify(startRes.body)?.slice(0,200)}`, "warn");
+      throw new Error("Tidak dapat redirect dari auth/x/start");
     }
 
-    // Resolve relative URL kalau ada
-    if (twitterAuthUrl.startsWith("/")) twitterAuthUrl = `${BASE}${twitterAuthUrl}`;
+    // Kalau masih twitter.com, resolve ke x.com
+    xAuthUrl = xAuthUrl.replace("https://twitter.com/", "https://x.com/");
+    log(`Akun #${index} — Twitter URL: ${xAuthUrl.slice(0, 70)}...`);
 
-    log(`Akun #${index} — Twitter URL: ${twitterAuthUrl.slice(0, 80)}...`);
+    const urlObj = new URL(xAuthUrl);
+    const state  = urlObj.searchParams.get("state");
 
-    // ── Step 2: GET halaman OAuth Twitter, follow redirect sampai dapat form ──
-    const twitterHeaders = {
-      "User-Agent": UA,
-      Cookie: `auth_token=${authToken}; ct0=${ct0}`,
-      "X-Csrf-Token": ct0,
-      Accept: "text/html,application/xhtml+xml,*/*",
-      "Accept-Language": "en-US,en;q=0.5",
-      Referer: "https://x.com/",
-    };
+    // ── Step 2: GET /i/api/2/oauth2/authorize → dapat auth_code (JSON) ───────
+    // KEY INSIGHT dari aka.js: path-nya /i/api/2/ bukan /i/
+    const getRes = await request({
+      hostname: BASE_X,
+      path: `/i/api/2/oauth2/authorize?${urlObj.searchParams.toString()}`,
+      method: "GET",
+      headers: xHeaders(authToken, ct0, {
+        accept: "application/json",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+      }),
+    });
 
-    // Follow redirect manual sampai dapat halaman yang bukan twitter.com -> x.com redirect
-    // atau sampai dapat callback ke fanszn
-    let currentUrl = twitterAuthUrl;
-    let oauthPageRes, oauthHtml = "", twitterCookies = "";
-    let callbackUrl = null;
+    log(`Akun #${index} — GET oauth2 [${getRes.status}]: ${JSON.stringify(getRes.body)?.slice(0, 200)}`);
 
-    for (let hop = 0; hop < 5; hop++) {
-      oauthPageRes = await fetch(currentUrl, {
-        method: "GET",
-        headers: { ...twitterHeaders, Referer: hop === 0 ? `${BASE}/fanszn/pick` : currentUrl },
-        redirect: "manual",
-      });
+    const authCode = getRes.body?.auth_code;
+    if (!authCode) {
+      throw new Error(`Tidak dapat auth_code (status=${getRes.status})`);
+    }
+    log(`Akun #${index} — auth_code: ${authCode.slice(0, 20)}...`);
 
-      const loc = oauthPageRes.headers.get("location");
-      const rawCookies = oauthPageRes.headers.getSetCookie?.() ||
-        (oauthPageRes.headers.get("set-cookie") ? [oauthPageRes.headers.get("set-cookie")] : []);
-      if (rawCookies.length) {
-        twitterCookies = mergeCookies(twitterCookies, rawCookies.map(c => c.split(";")[0]).join("; "));
-      }
+    // ── Step 3: POST api.x.com/2/oauth2/authorize → dapat redirect_uri ───────
+    const approveBody = new URLSearchParams({
+      approval:     "true",
+      code:         authCode,
+      consent_flow: "web_consent",
+    }).toString();
 
-      log(`Akun #${index} — hop${hop} [${oauthPageRes.status}] ${currentUrl.slice(0, 60)}... → ${loc ? loc.slice(0, 60) + "..." : "no-redirect"}`);
+    const approveRes = await request({
+      hostname: BASE_X_API,
+      path: "/2/oauth2/authorize",
+      method: "POST",
+      headers: xHeaders(authToken, ct0, {
+        "content-type": "application/x-www-form-urlencoded",
+        "content-length": Buffer.byteLength(approveBody),
+      }),
+    }, approveBody);
 
-      if (!loc) {
-        // Dapat halaman HTML — ini halaman OAuth authorize
-        oauthHtml = await oauthPageRes.text().catch(() => "");
-        break;
-      }
+    log(`Akun #${index} — approve [${approveRes.status}]: ${JSON.stringify(approveRes.body)?.slice(0, 200)}`);
 
-      const resolvedLoc = loc.startsWith("/") ? new URL(loc, currentUrl).href : loc;
-
-      // Kalau redirect ke callback FansZN (harus ada ?code= atau /callback)
-      if (resolvedLoc.includes("fanszn.ipx.exchange") && (resolvedLoc.includes("code=") || resolvedLoc.includes("/callback"))) {
-        callbackUrl = resolvedLoc;
-        log(`Akun #${index} — langsung dapat callback FansZN!`);
-        break;
-      }
-
-      currentUrl = resolvedLoc;
+    const redirectUri = approveRes.body?.redirect_uri;
+    if (!redirectUri) {
+      throw new Error(`Tidak dapat redirect_uri (status=${approveRes.status})`);
     }
 
-    if (!callbackUrl) {
-      // oauthHtml & twitterCookies sudah di-set di dalam loop di atas
-      log(`Akun #${index} — OAuth2 PKCE flow (status: ${oauthPageRes.status})`);
+    const oauthCode = new URL(redirectUri).searchParams.get("code");
+    if (!oauthCode) throw new Error("Tidak ada code di redirect_uri");
 
-      // Debug: scan halaman OAuth buat cari form/api endpoint
-      const pageFormAction  = oauthHtml.match(/action="([^"]+)"/)?.[1];
-      const pageHiddenFields = [...oauthHtml.matchAll(/name="([^"]+)"[^>]*value="([^"]*)"/g)]
-        .map(m => `${m[1]}=${m[2].slice(0,40)}`);
-      const pageScripts = [...oauthHtml.matchAll(/(?:fetch|axios|post)\(['"`](\/[^'"`]+)['"`]/gi)].map(m=>m[1]);
-      const pageApiUrls = [...oauthHtml.matchAll(/"(\/[12][^"]*oauth[^"]*|\/i\/api[^"]+)"/g)].map(m=>m[1]);
-      log(`Akun #${index} — page form action: ${pageFormAction || "none"}`);
-      log(`Akun #${index} — page hidden fields: ${pageHiddenFields.join(" | ") || "none"}`);
-      if (pageScripts.length)  log(`Akun #${index} — page fetches: ${pageScripts.join(" | ")}`);
-      if (pageApiUrls.length)  log(`Akun #${index} — page api urls: ${pageApiUrls.join(" | ")}`);
-      log(`Akun #${index} — page HTML (600): ${oauthHtml.slice(0, 600)}`);
+    log(`Akun #${index} — oauth code: ${oauthCode.slice(0, 20)}...`);
 
-      // POST approve ke Twitter OAuth2
-      const authUrl = new URL(currentUrl);
-      const state   = authUrl.searchParams.get("state") || "";
-
-      const approveRes = await fetch("https://x.com/i/oauth2/authorize", {
-        method: "POST",
-        headers: {
-          ...twitterHeaders,
-          "Content-Type": "application/json",
-          Cookie: `auth_token=${authToken}; ct0=${ct0}; ${twitterCookies}`,
-          "X-Csrf-Token": ct0,
-          "X-Twitter-Auth-Type": "OAuth2Session",
-          "X-Twitter-Client-Language": "en",
-          Authorization: `Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I6xUEXAMPLEKEY`,
-          Origin: "https://x.com",
-          Referer: currentUrl,
-        },
-        body: JSON.stringify({
-          approval:              true,
-          code_challenge:        authUrl.searchParams.get("code_challenge")        || "",
-          code_challenge_method: authUrl.searchParams.get("code_challenge_method") || "S256",
-          client_id:             authUrl.searchParams.get("client_id")             || "",
-          redirect_uri:          authUrl.searchParams.get("redirect_uri")          || "",
-          response_type:         "code",
-          scope:                 authUrl.searchParams.get("scope")                 || "",
-          state,
-        }),
-        redirect: "manual",
-      });
-
-      callbackUrl = approveRes.headers.get("location");
-      log(`Akun #${index} — approve [${approveRes.status}] loc: ${callbackUrl?.slice(0, 80) || "none"}`);
-
-      if (!callbackUrl) {
-        const approveBody = await approveRes.text().catch(() => "");
-        // Twitter OAuth2 kadang return JSON dengan redirect_uri atau auth_code
-        try {
-          const j = JSON.parse(approveBody);
-          if (j.redirect_uri || j.location || j.url) {
-            callbackUrl = j.redirect_uri || j.location || j.url;
-          } else if (j.auth_code) {
-            const redir = authUrl.searchParams.get("redirect_uri") || "";
-            callbackUrl = `${redir}?code=${j.auth_code}&state=${encodeURIComponent(state)}`;
-          }
-        } catch (_) {}
-
-        if (!callbackUrl) {
-          // Print semua hidden input fields dari HTML halaman OAuth
-          const hiddenFields = [...approveBody.matchAll(/name="([^"]+)"[^>]*value="([^"]*)"/g)]
-            .map(m => `${m[1]}=${m[2].slice(0,40)}`);
-          const formAction = approveBody.match(/action="([^"]+)"/)?.[1];
-          const jsApiCalls = [...approveBody.matchAll(/fetch\(['"`]([^'"`]+)['"`]/g)].map(m => m[1]);
-          log(`Akun #${index} — form action: ${formAction || "none"}`, "warn");
-          log(`Akun #${index} — hidden fields: ${hiddenFields.join(" | ") || "none"}`, "warn");
-          log(`Akun #${index} — js fetches: ${jsApiCalls.join(" | ") || "none"}`, "warn");
-          throw new Error(`Gagal approve OAuth2 Twitter (status ${approveRes.status})`);
-        }
-      }
-
-      if (callbackUrl.startsWith("/")) callbackUrl = `https://x.com${callbackUrl}`;
-    }
-
-    log(`Akun #${index} — callback: ${callbackUrl?.slice(0, 100)}...`);
-
-    // ── Step 3: Follow callback → FansZN /auth/handle ────────────────────────
-    const callbackRes = await fetch(callbackUrl, {
+    // ── Step 4: GET /api/fanszn/auth/x/callback ───────────────────────────────
+    const cbState = new URL(redirectUri).searchParams.get("state") || state;
+    const cbRes = await request({
+      hostname: BASE_FANSZN,
+      path: `/api/fanszn/auth/x/callback?state=${encodeURIComponent(cbState)}&code=${encodeURIComponent(oauthCode)}`,
       method: "GET",
       headers: {
-        "User-Agent": UA,
-        Cookie: jar,
-        Accept: "text/html,application/xhtml+xml,*/*",
-        Referer: "https://x.com/",
+        accept: "*/*",
+        "user-agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+        referer: "https://x.com/",
       },
-      redirect: "follow",
     });
 
-    setCookies(callbackRes);
+    log(`Akun #${index} — callback [${cbRes.status}]: loc=${cbRes.headers?.location?.slice(0,80) || "none"} | body=${JSON.stringify(cbRes.body)?.slice(0,150)}`);
 
-    const finalUrl  = callbackRes.url;
-    const finalBody = await callbackRes.text().catch(() => "");
+    // Session cookie dari callback
+    const rawCookies = [].concat(cbRes.headers?.["set-cookie"] || []);
+    const sessionCookie = rawCookies.map(c => c.split(";")[0]).join("; ");
 
-    log(`Akun #${index} — final URL: ${finalUrl}`);
-
-    // ── Step 4: Verifikasi session via /api/fanszn/me ─────────────────────────
-    const meRes  = await fetch(`${BASE}/api/fanszn/me`, {
+    // ── Step 5: Verifikasi via /api/fanszn/me ─────────────────────────────────
+    const meRes = await request({
+      hostname: BASE_FANSZN,
+      path: "/api/fanszn/me",
       method: "GET",
       headers: {
-        "User-Agent": UA,
-        Accept: "application/json",
-        Cookie: jar,
-        Referer: `${BASE}/fanszn/connect`,
+        accept: "application/json",
+        "user-agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+        cookie: sessionCookie,
+        referer: `https://${BASE_FANSZN}/fanszn/connect`,
       },
     });
-    const meData = await meRes.json().catch(() => null);
 
-    if (meRes.ok && meData?.success !== false) {
-      const handle = meData?.me?.handle || meData?.handle || "?";
+    log(`Akun #${index} — me [${meRes.status}]: ${JSON.stringify(meRes.body)?.slice(0, 200)}`);
+
+    if (meRes.status === 200 && meRes.body?.success !== false) {
+      const handle = meRes.body?.me?.handle || meRes.body?.handle || "?";
       log(`Akun #${index} — ✓ Connected! (@${handle})`, "ok");
       return { index, status: "ok", handle };
     }
 
-    // Fallback cek dari final URL
-    if (finalUrl.includes("/fanszn/connect") || finalUrl.includes("/fanszn/hub") || finalUrl.includes("/fanszn/pick")) {
-      log(`Akun #${index} — ✓ Redirect ke FansZN (session OK)`, "ok");
+    // Fallback: callback redirect ke fanszn = sukses
+    const loc = cbRes.headers?.location || "";
+    if (loc.includes("fanszn")) {
+      log(`Akun #${index} — ✓ Callback redirect ke FansZN`, "ok");
       return { index, status: "ok" };
     }
 
-    log(`Akun #${index} — me status: ${meRes.status} | ${JSON.stringify(meData)?.slice(0, 150)}`, "warn");
     return { index, status: "unknown", detail: `me=${meRes.status}` };
 
   } catch (err) {
@@ -322,66 +207,37 @@ async function connectX(account) {
   }
 }
 
-// Merge dua string cookies (key=value; key=value)
-function mergeCookies(existing, incoming) {
-  const map = new Map();
-  for (const part of (existing + "; " + incoming).split(";")) {
-    const [k, ...v] = part.trim().split("=");
-    if (k) map.set(k.trim(), v.join("=").trim());
-  }
-  return [...map.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
-}
-
 // ─── MENU ─────────────────────────────────────────────────────────────────────
 async function showMenu(accounts) {
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
-
+  const rl  = readline.createInterface({ input: process.stdin, output: process.stdout });
   const ask = (q) => new Promise((res) => rl.question(q, res));
 
   console.log("\n╔══════════════════════════════╗");
   console.log("║   FansZN — Connect X Bot     ║");
   console.log("╚══════════════════════════════╝");
-  console.log(`  Total akun loaded: ${accounts.length}\n`);
-  console.log("  [1] 1 Akun (pilih nomor)");
+  console.log(`  Total akun: ${accounts.length}\n`);
+  console.log("  [1] 1 Akun");
   console.log("  [2] Semua akun");
   console.log("  [3] From X to end\n");
 
-  const choice = await ask("Pilih opsi (1/2/3): ");
-
-  let targets = [];
+  const choice = await ask("Pilih (1/2/3): ");
+  let targets  = [];
 
   if (choice === "1") {
-    const num = await ask(`Masukkan nomor akun (1-${accounts.length}): `);
+    const num = await ask(`Nomor akun (1-${accounts.length}): `);
     const idx = parseInt(num);
-    if (isNaN(idx) || idx < 1 || idx > accounts.length) {
-      console.log("Nomor invalid.");
-      rl.close();
-      process.exit(1);
-    }
+    if (isNaN(idx) || idx < 1 || idx > accounts.length) { console.log("Invalid."); process.exit(1); }
     targets = [accounts[idx - 1]];
   } else if (choice === "2") {
     targets = accounts;
   } else if (choice === "3") {
-    const from = await ask(
-      `From akun nomor berapa? (1-${accounts.length}): `
-    );
-    const startIdx = parseInt(from) - 1;
-    if (isNaN(startIdx) || startIdx < 0 || startIdx >= accounts.length) {
-      console.log("Nomor invalid.");
-      rl.close();
-      process.exit(1);
-    }
-    targets = accounts.slice(startIdx);
-    console.log(
-      `  → Akun #${startIdx + 1} sampai #${accounts.length} (${targets.length} akun)`
-    );
+    const from  = await ask(`From akun (1-${accounts.length}): `);
+    const start = parseInt(from) - 1;
+    if (isNaN(start) || start < 0 || start >= accounts.length) { console.log("Invalid."); process.exit(1); }
+    targets = accounts.slice(start);
+    console.log(`  → Akun #${start + 1} sampai #${accounts.length} (${targets.length} akun)`);
   } else {
-    console.log("Pilihan tidak valid.");
-    rl.close();
-    process.exit(1);
+    console.log("Invalid."); process.exit(1);
   }
 
   rl.close();
@@ -390,59 +246,35 @@ async function showMenu(accounts) {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  if (DEBUG) {
-    await probeEndpoints();
-    process.exit(0);
-  }
-
   const accounts = loadAccounts();
-
-  if (accounts.length === 0) {
-    log("Tidak ada akun di akun.txt!", "err");
-    process.exit(1);
-  }
+  if (!accounts.length) { log("Tidak ada akun!", "err"); process.exit(1); }
 
   const targets = await showMenu(accounts);
-
   console.log(`\n→ Proses ${targets.length} akun...\n`);
 
   const results = [];
-
   for (let i = 0; i < targets.length; i++) {
-    const acct = targets[i];
-    const result = await connectX(acct);
+    const result = await connectX(targets[i]);
     results.push(result);
-
     if (i < targets.length - 1) {
-      await sleep(DELAY_MS);
+      const cd = Math.floor(Math.random() * 3000) + DELAY_MS;
+      log(`Delay ${(cd/1000).toFixed(1)}s...`);
+      await sleep(cd);
     }
   }
 
-  // ─── SUMMARY ───────────────────────────────────────────────────────────────
   console.log("\n══════════ SUMMARY ══════════");
-  const ok = results.filter((r) => r.status === "ok").length;
-  const err = results.filter((r) => r.status === "err").length;
-  const unk = results.filter((r) => r.status === "unknown").length;
-
-  console.log(`  ✓ Berhasil  : ${ok}`);
-  console.log(`  ✗ Error     : ${err}`);
-  console.log(`  ⚠ Unknown  : ${unk}`);
-
-  if (err > 0 || unk > 0) {
-    console.log("\n  Detail:");
-    results
-      .filter((r) => r.status !== "ok")
-      .forEach((r) =>
-        console.log(
-          `  Akun #${r.index} [${r.status}]: ${r.detail || "-"}`
-        )
-      );
+  const ok  = results.filter(r => r.status === "ok").length;
+  const err = results.filter(r => r.status === "err").length;
+  const unk = results.filter(r => r.status === "unknown").length;
+  console.log(`  ✓ Berhasil : ${ok}`);
+  console.log(`  ✗ Error    : ${err}`);
+  console.log(`  ⚠ Unknown : ${unk}`);
+  if (err || unk) {
+    results.filter(r => r.status !== "ok")
+      .forEach(r => console.log(`  Akun #${r.index} [${r.status}]: ${r.detail || "-"}`));
   }
-
   console.log("═════════════════════════════\n");
 }
 
-main().catch((err) => {
-  log(`Fatal: ${err.message}`, "err");
-  process.exit(1);
-});
+main().catch(e => { log(`Fatal: ${e.message}`, "err"); process.exit(1); });
