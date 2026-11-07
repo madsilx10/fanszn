@@ -178,24 +178,58 @@ async function connectX(authToken, ct0, index) {
   if (!oauthCode) throw new Error("Tidak ada code di redirect_uri");
   log(`Akun #${index} — oauth code ok`);
 
-  // Step 4: GET /api/fanszn/auth/x/callback → dapat session cookie
+  // Step 4: GET /api/fanszn/auth/x/callback → ikutin redirect sampai dapat session cookie
   const cbState = new URL(redirectUri).searchParams.get("state") || state;
-  const cbRes = await request({
-    hostname: BASE,
-    path: `/api/fanszn/auth/x/callback?state=${encodeURIComponent(cbState)}&code=${encodeURIComponent(oauthCode)}`,
-    method: "GET",
-    headers: {
-      accept: "*/*",
-      "user-agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
-      referer: "https://x.com/",
-    },
-  });
+  let cookieJar  = "";
+  let currentPath = `/api/fanszn/auth/x/callback?state=${encodeURIComponent(cbState)}&code=${encodeURIComponent(oauthCode)}`;
+  let currentHost = BASE;
 
-  // Extract session cookies
-  const rawCookies = [].concat(cbRes.headers?.["set-cookie"] || []);
-  const sessionCookie = rawCookies.map(c => c.split(";")[0]).join("; ");
+  for (let hop = 0; hop < 6; hop++) {
+    const cbRes = await request({
+      hostname: currentHost,
+      path: currentPath,
+      method: "GET",
+      headers: {
+        accept: "*/*",
+        "user-agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+        referer: "https://x.com/",
+        ...(cookieJar ? { cookie: cookieJar } : {}),
+      },
+    });
 
-  if (!sessionCookie) throw new Error(`Callback tidak return cookie (${cbRes.status})`);
+    // Kumpulin cookies dari tiap hop
+    const hopCookies = [].concat(cbRes.headers?.["set-cookie"] || [])
+      .map(c => c.split(";")[0]);
+    if (hopCookies.length) {
+      const incoming = hopCookies.join("; ");
+      cookieJar = cookieJar ? `${cookieJar}; ${incoming}` : incoming;
+    }
+
+    log(`Akun #${index} — cb hop${hop} [${cbRes.status}] cookies: ${hopCookies.length}`);
+
+    // Kalau bukan redirect, selesai
+    if (cbRes.status < 300 || cbRes.status >= 400) break;
+
+    const loc = cbRes.headers?.location;
+    if (!loc) break;
+
+    // Resolve redirect URL
+    if (loc.startsWith("http")) {
+      const u = new URL(loc);
+      currentHost = u.hostname;
+      currentPath = u.pathname + u.search;
+    } else {
+      currentPath = loc;
+    }
+  }
+
+  if (!cookieJar) throw new Error(`Callback tidak return cookie`);
+
+  // Pastiin fanszn_session ada
+  const sessionCookie = cookieJar;
+  if (!sessionCookie.includes("fanszn_session") && !sessionCookie.includes("fanszn_x_at")) {
+    log(`Akun #${index} — cookie jar: ${sessionCookie.slice(0,100)}`, "warn");
+  }
   log(`Akun #${index} — session cookie ok`);
 
   return sessionCookie;
