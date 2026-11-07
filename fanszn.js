@@ -49,30 +49,43 @@ async function probeEndpoints() {
   const BASE = "https://fanszn.ipx.exchange";
   const UA = "Mozilla/5.0 (Linux; Android 11; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
 
-  const endpoints = [
-    { method: "GET",  url: `${BASE}/api/auth/csrf` },
-    { method: "GET",  url: `${BASE}/fanszn/api/auth/csrf` },
-    { method: "GET",  url: `${BASE}/api/auth/providers` },
-    { method: "GET",  url: `${BASE}/fanszn/api/auth/providers` },
-    { method: "GET",  url: `${BASE}/api/auth/signin` },
-    { method: "GET",  url: `${BASE}/fanszn/api/auth/signin` },
-  ];
+  // Step 1: Ambil HTML halaman, extract semua _next/static JS chunk URLs
+  console.log("Fetching page HTML...");
+  const pageRes = await fetch(`${BASE}/fanszn/pick`, {
+    headers: { "User-Agent": UA, Accept: "text/html" },
+  });
+  const html = await pageRes.text();
 
-  console.log("\n══════ DEBUG PROBE ══════");
-  for (const ep of endpoints) {
+  // Extract semua script src
+  const scriptMatches = [...html.matchAll(/src="([^"]*\.js[^"]*)"/g)];
+  const scriptUrls = scriptMatches
+    .map((m) => m[1])
+    .filter((u) => u.includes("_next") || u.includes("chunk") || u.includes("app") || u.includes("page"))
+    .map((u) => u.startsWith("http") ? u : `${BASE}${u}`);
+
+  console.log(`\nFound ${scriptUrls.length} script(s):\n${scriptUrls.join("\n")}`);
+
+  // Step 2: Download tiap chunk, cari string auth/twitter/signin/oauth
+  console.log("\n══ Scanning JS bundles for auth endpoints ══");
+  const keywords = ["signin", "twitter", "oauth", "auth", "/api/", "callback", "csrf", "token"];
+
+  for (const url of scriptUrls) {
     try {
-      const res = await fetch(ep.url, {
-        method: ep.method,
-        headers: { "User-Agent": UA, Accept: "application/json, text/html, */*" },
-        redirect: "manual",
-      });
-      const body = await res.text().catch(() => "");
-      const loc  = res.headers.get("location") || "";
-      console.log(`\n[${res.status}] ${ep.url}`);
-      if (loc)  console.log(`  → redirect: ${loc}`);
-      if (body) console.log(`  body: ${body.slice(0, 200)}`);
+      const r = await fetch(url, { headers: { "User-Agent": UA } });
+      const src = await r.text();
+
+      // Cari semua string yang mirip API path
+      const paths = [...src.matchAll(/["'`](\/[a-zA-Z0-9/_\-\.?=&%]+)["'`]/g)]
+        .map((m) => m[1])
+        .filter((p) => keywords.some((k) => p.toLowerCase().includes(k)));
+
+      if (paths.length) {
+        console.log(`\n[${url.split("/").pop()}]`);
+        // Dedup dan print
+        [...new Set(paths)].slice(0, 30).forEach((p) => console.log(`  ${p}`));
+      }
     } catch (e) {
-      console.log(`\n[ERR] ${ep.url} → ${e.message}`);
+      console.log(`ERR fetching ${url}: ${e.message}`);
     }
   }
   console.log("\n═════════════════════════\n");
