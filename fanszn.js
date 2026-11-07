@@ -46,124 +46,162 @@ function loadAccounts() {
 // ─── CORE: CONNECT X ──────────────────────────────────────────────────────────
 async function connectX(account) {
   const { authToken, ct0, index } = account;
+  const BASE = "https://fanszn.ipx.exchange";
+  const UA = "Mozilla/5.0 (Linux; Android 11; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
 
   log(`Akun #${index} — mulai connect X...`);
 
+  // Simpan cookies FansZN session di sini
+  let fansCookies = "";
+
   try {
-    // Step 1: Hit ref link dulu buat dapet session / redirect
-    const refRes = await fetch(REF_LINK, {
+    // ── Step 1: Ambil CSRF token dari NextAuth ────────────────────────────────
+    const csrfRes = await fetch(`${BASE}/api/auth/csrf`, {
       method: "GET",
       headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Linux; Android 11; Mobile) AppleWebKit/537.36",
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
+        "User-Agent": UA,
+        Accept: "application/json",
+        Referer: `${BASE}/fanszn/pick?ref=FAN-3CVF`,
       },
-      redirect: "follow",
     });
 
-    const refUrl = refRes.url; // URL akhir setelah redirect
-    log(`Akun #${index} — landed: ${refUrl}`);
+    // Simpan cookies dari response
+    const setCookieHeaders = csrfRes.headers.getSetCookie?.() ||
+      (csrfRes.headers.get("set-cookie") ? [csrfRes.headers.get("set-cookie")] : []);
+    if (setCookieHeaders.length) {
+      fansCookies = setCookieHeaders
+        .map((c) => c.split(";")[0])
+        .join("; ");
+      log(`Akun #${index} — session cookies: ${fansCookies.slice(0, 60)}...`);
+    }
 
-    // Step 2: Request X OAuth dari FansZN
-    // Ambil base origin dari URL final
-    const origin = new URL(refUrl).origin;
+    const csrfData = await csrfRes.json().catch(() => null);
+    if (!csrfData?.csrfToken) {
+      log(`Akun #${index} — CSRF response: ${JSON.stringify(csrfData)}`, "warn");
+      throw new Error("Gagal ambil CSRF token");
+    }
+    const csrfToken = csrfData.csrfToken;
+    log(`Akun #${index} — CSRF OK: ${csrfToken.slice(0, 20)}...`);
 
-    const oauthRes = await fetch(`${origin}/api/auth/twitter`, {
-      method: "GET",
+    // ── Step 2: POST ke NextAuth signin/twitter → dapat redirect ke X ────────
+    const signinRes = await fetch(`${BASE}/api/auth/signin/twitter`, {
+      method: "POST",
       headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Linux; Android 11; Mobile) AppleWebKit/537.36",
-        Referer: refUrl,
-        Accept: "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.5",
+        "User-Agent": UA,
+        "Content-Type": "application/x-www-form-urlencoded",
+        Accept: "application/json, */*",
+        Referer: `${BASE}/fanszn/pick?ref=FAN-3CVF`,
+        Cookie: fansCookies,
       },
+      body: new URLSearchParams({
+        csrfToken,
+        callbackUrl: `${BASE}/fanszn/pick?ref=FAN-3CVF`,
+        json: "true",
+      }).toString(),
       redirect: "manual",
     });
 
-    // Ambil redirect URL ke Twitter/X
-    const twitterAuthUrl =
-      oauthRes.headers.get("location") ||
-      (await oauthRes
-        .json()
-        .then((j) => j.url || j.redirect_url)
-        .catch(() => null));
+    // NextAuth bisa return JSON { url } atau redirect langsung
+    let twitterAuthUrl = signinRes.headers.get("location");
 
     if (!twitterAuthUrl) {
-      // Coba parse response body
-      const body = await oauthRes.text().catch(() => "");
-      log(`Akun #${index} — response: ${body.slice(0, 200)}`, "warn");
-      throw new Error("Tidak dapat oauth URL dari FansZN");
+      const signinBody = await signinRes.text().catch(() => "");
+      try {
+        const j = JSON.parse(signinBody);
+        twitterAuthUrl = j.url || j.redirect_url;
+      } catch (_) {}
+
+      if (!twitterAuthUrl) {
+        log(`Akun #${index} — signin status: ${signinRes.status} | body: ${signinBody.slice(0, 300)}`, "warn");
+        throw new Error("Tidak dapat Twitter OAuth URL dari NextAuth");
+      }
     }
 
-    log(`Akun #${index} — Twitter auth URL: ${twitterAuthUrl.slice(0, 80)}...`);
+    // Update cookies kalau ada
+    const signinCookies = signinRes.headers.getSetCookie?.() ||
+      (signinRes.headers.get("set-cookie") ? [signinRes.headers.get("set-cookie")] : []);
+    if (signinCookies.length) {
+      const newCookies = signinCookies.map((c) => c.split(";")[0]).join("; ");
+      fansCookies = mergeCookies(fansCookies, newCookies);
+    }
 
-    // Step 3: Hit Twitter OAuth URL pakai cookies akun
+    log(`Akun #${index} — Twitter OAuth URL: ${twitterAuthUrl.slice(0, 80)}...`);
+
+    // ── Step 3: Hit Twitter OAuth URL pakai cookies akun ─────────────────────
     const twitterRes = await fetch(twitterAuthUrl, {
       method: "GET",
       headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Linux; Android 11; Mobile) AppleWebKit/537.36",
+        "User-Agent": UA,
         Cookie: `auth_token=${authToken}; ct0=${ct0}`,
-        Authorization: `Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I6xUEXAMPLE`,
         "X-Csrf-Token": ct0,
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        Referer: "https://twitter.com/",
       },
       redirect: "manual",
     });
 
-    const callbackUrl = twitterRes.headers.get("location");
+    let callbackUrl = twitterRes.headers.get("location");
 
     if (!callbackUrl) {
-      const body = await twitterRes.text().catch(() => "");
-      log(
-        `Akun #${index} — Twitter response status: ${twitterRes.status}`,
-        "warn"
-      );
-      log(`Akun #${index} — body preview: ${body.slice(0, 300)}`, "warn");
-      throw new Error("Tidak ada callback redirect dari Twitter");
+      const twitterBody = await twitterRes.text().catch(() => "");
+      log(`Akun #${index} — Twitter status: ${twitterRes.status} | body: ${twitterBody.slice(0, 400)}`, "warn");
+      throw new Error("Tidak ada callback redirect dari Twitter/X");
     }
 
-    log(
-      `Akun #${index} — callback: ${callbackUrl.slice(0, 80)}...`,
-      callbackUrl.includes("fanszn") ? "ok" : "warn"
-    );
+    // Kalau callback URL relative, tambah base Twitter
+    if (callbackUrl.startsWith("/")) {
+      callbackUrl = `https://twitter.com${callbackUrl}`;
+    }
 
-    // Step 4: Hit callback URL ke FansZN
+    log(`Akun #${index} — callback: ${callbackUrl.slice(0, 100)}...`);
+
+    // ── Step 4: Follow callback ke FansZN ─────────────────────────────────────
     const callbackRes = await fetch(callbackUrl, {
       method: "GET",
       headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Linux; Android 11; Mobile) AppleWebKit/537.36",
-        Accept: "application/json, text/plain, */*",
+        "User-Agent": UA,
+        Cookie: fansCookies,
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         Referer: "https://twitter.com/",
       },
       redirect: "follow",
     });
 
     const callbackBody = await callbackRes.text().catch(() => "");
+    const finalUrl = callbackRes.url;
+
+    log(`Akun #${index} — final URL: ${finalUrl}`);
+
     const success =
-      callbackRes.ok ||
-      callbackBody.toLowerCase().includes("success") ||
-      callbackBody.toLowerCase().includes("connected") ||
-      callbackBody.toLowerCase().includes("linked");
+      finalUrl.includes("fanszn") ||
+      callbackBody.toLowerCase().includes("fan card") ||
+      callbackBody.toLowerCase().includes("pick your fandom") ||
+      callbackBody.toLowerCase().includes("step 2") ||
+      callbackRes.ok;
 
     if (success) {
-      log(`Akun #${index} — X berhasil di-connect! ✓`, "ok");
+      log(`Akun #${index} — ✓ X berhasil di-connect!`, "ok");
       return { index, status: "ok" };
     } else {
-      log(
-        `Akun #${index} — callback response (${callbackRes.status}): ${callbackBody.slice(0, 200)}`,
-        "warn"
-      );
-      return { index, status: "unknown", detail: callbackBody.slice(0, 100) };
+      log(`Akun #${index} — final status: ${callbackRes.status} | preview: ${callbackBody.slice(0, 200)}`, "warn");
+      return { index, status: "unknown", detail: `status ${callbackRes.status}` };
     }
+
   } catch (err) {
     log(`Akun #${index} — ERROR: ${err.message}`, "err");
     return { index, status: "err", detail: err.message };
   }
+}
+
+// Merge dua string cookies (key=value; key=value)
+function mergeCookies(existing, incoming) {
+  const map = new Map();
+  for (const part of (existing + "; " + incoming).split(";")) {
+    const [k, ...v] = part.trim().split("=");
+    if (k) map.set(k.trim(), v.join("=").trim());
+  }
+  return [...map.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
 }
 
 // ─── MENU ─────────────────────────────────────────────────────────────────────
