@@ -202,14 +202,17 @@ async function connectX(account) {
         method: "POST",
         headers: {
           ...twitterHeaders,
-          "Content-Type": "application/x-www-form-urlencoded",
+          "Content-Type": "application/json",
           Cookie: `auth_token=${authToken}; ct0=${ct0}; ${twitterCookies}`,
           "X-Csrf-Token": ct0,
+          "X-Twitter-Auth-Type": "OAuth2Session",
+          "X-Twitter-Client-Language": "en",
+          Authorization: `Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I6xUEXAMPLEKEY`,
           Origin: "https://x.com",
           Referer: currentUrl,
         },
-        body: new URLSearchParams({
-          approval:              "true",
+        body: JSON.stringify({
+          approval:              true,
           code_challenge:        authUrl.searchParams.get("code_challenge")        || "",
           code_challenge_method: authUrl.searchParams.get("code_challenge_method") || "S256",
           client_id:             authUrl.searchParams.get("client_id")             || "",
@@ -217,7 +220,7 @@ async function connectX(account) {
           response_type:         "code",
           scope:                 authUrl.searchParams.get("scope")                 || "",
           state,
-        }).toString(),
+        }),
         redirect: "manual",
       });
 
@@ -238,7 +241,7 @@ async function connectX(account) {
         } catch (_) {}
 
         if (!callbackUrl) {
-          log(`Akun #${index} — approve body: ${approveBody.slice(0, 400)}`, "warn");
+          log(`Akun #${index} — approve body (800): ${approveBody.slice(0, 800)}`, "warn");
           throw new Error(`Gagal approve OAuth2 Twitter (status ${approveRes.status})`);
         }
       }
