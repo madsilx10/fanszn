@@ -94,97 +94,62 @@ async function probeEndpoints() {
 // ─── CORE: CONNECT X ──────────────────────────────────────────────────────────
 async function connectX(account) {
   const { authToken, ct0, index } = account;
-  const BASE = "https://fanszn.ipx.exchange";
-  const UA = "Mozilla/5.0 (Linux; Android 11; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
+  const BASE  = "https://fanszn.ipx.exchange";
+  const UA    = "Mozilla/5.0 (Linux; Android 11; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
+  const REF   = "FAN-3CVF";
 
-  log(`Akun #${index} — mulai connect X...`);
+  // Cookie jar FansZN session
+  let jar = "";
 
-  // Simpan cookies FansZN session di sini
-  let fansCookies = "";
+  const setCookies = (res) => {
+    const raw = res.headers.getSetCookie?.() ||
+      (res.headers.get("set-cookie") ? [res.headers.get("set-cookie")] : []);
+    if (raw.length) jar = mergeCookies(jar, raw.map(c => c.split(";")[0]).join("; "));
+  };
+
+  log(`Akun #${index} — mulai...`);
 
   try {
-    // ── Step 1: Ambil CSRF token dari NextAuth ────────────────────────────────
-    const csrfRes = await fetch(`${BASE}/api/auth/csrf`, {
+    // ── Step 1: GET /api/fanszn/auth/x/start → redirect ke Twitter OAuth ─────
+    // URL persis dari fungsi kq() di source: /api/fanszn/auth/x/start?returnTo=...&ref=...
+    const startUrl = `${BASE}/api/fanszn/auth/x/start?returnTo=%2Ffanszn%2Fconnect&ref=${REF}`;
+
+    const startRes = await fetch(startUrl, {
       method: "GET",
       headers: {
         "User-Agent": UA,
-        Accept: "application/json",
-        Referer: `${BASE}/fanszn/pick?ref=FAN-3CVF`,
+        Accept: "text/html,application/xhtml+xml,*/*",
+        Referer: `${BASE}/fanszn/pick?ref=${REF}`,
+        Cookie: jar,
       },
-    });
-
-    // Simpan cookies dari response
-    const setCookieHeaders = csrfRes.headers.getSetCookie?.() ||
-      (csrfRes.headers.get("set-cookie") ? [csrfRes.headers.get("set-cookie")] : []);
-    if (setCookieHeaders.length) {
-      fansCookies = setCookieHeaders
-        .map((c) => c.split(";")[0])
-        .join("; ");
-      log(`Akun #${index} — session cookies: ${fansCookies.slice(0, 60)}...`);
-    }
-
-    const csrfData = await csrfRes.json().catch(() => null);
-    if (!csrfData?.csrfToken) {
-      log(`Akun #${index} — CSRF response: ${JSON.stringify(csrfData)}`, "warn");
-      throw new Error("Gagal ambil CSRF token");
-    }
-    const csrfToken = csrfData.csrfToken;
-    log(`Akun #${index} — CSRF OK: ${csrfToken.slice(0, 20)}...`);
-
-    // ── Step 2: POST ke NextAuth signin/twitter → dapat redirect ke X ────────
-    const signinRes = await fetch(`${BASE}/api/auth/signin/twitter`, {
-      method: "POST",
-      headers: {
-        "User-Agent": UA,
-        "Content-Type": "application/x-www-form-urlencoded",
-        Accept: "application/json, */*",
-        Referer: `${BASE}/fanszn/pick?ref=FAN-3CVF`,
-        Cookie: fansCookies,
-      },
-      body: new URLSearchParams({
-        csrfToken,
-        callbackUrl: `${BASE}/fanszn/pick?ref=FAN-3CVF`,
-        json: "true",
-      }).toString(),
       redirect: "manual",
     });
 
-    // NextAuth bisa return JSON { url } atau redirect langsung
-    let twitterAuthUrl = signinRes.headers.get("location");
+    setCookies(startRes);
+
+    let twitterAuthUrl = startRes.headers.get("location");
 
     if (!twitterAuthUrl) {
-      const signinBody = await signinRes.text().catch(() => "");
-      try {
-        const j = JSON.parse(signinBody);
-        twitterAuthUrl = j.url || j.redirect_url;
-      } catch (_) {}
-
-      if (!twitterAuthUrl) {
-        log(`Akun #${index} — signin status: ${signinRes.status} | body: ${signinBody.slice(0, 300)}`, "warn");
-        throw new Error("Tidak dapat Twitter OAuth URL dari NextAuth");
-      }
+      const body = await startRes.text().catch(() => "");
+      log(`Akun #${index} — start status: ${startRes.status} | body: ${body.slice(0, 300)}`, "warn");
+      throw new Error("Tidak dapat redirect Twitter dari /auth/x/start");
     }
 
-    // Update cookies kalau ada
-    const signinCookies = signinRes.headers.getSetCookie?.() ||
-      (signinRes.headers.get("set-cookie") ? [signinRes.headers.get("set-cookie")] : []);
-    if (signinCookies.length) {
-      const newCookies = signinCookies.map((c) => c.split(";")[0]).join("; ");
-      fansCookies = mergeCookies(fansCookies, newCookies);
-    }
+    // Resolve relative URL kalau ada
+    if (twitterAuthUrl.startsWith("/")) twitterAuthUrl = `${BASE}${twitterAuthUrl}`;
 
-    log(`Akun #${index} — Twitter OAuth URL: ${twitterAuthUrl.slice(0, 80)}...`);
+    log(`Akun #${index} — Twitter URL: ${twitterAuthUrl.slice(0, 80)}...`);
 
-    // ── Step 3: Hit Twitter OAuth URL pakai cookies akun ─────────────────────
+    // ── Step 2: Hit Twitter OAuth pakai cookies akun ──────────────────────────
     const twitterRes = await fetch(twitterAuthUrl, {
       method: "GET",
       headers: {
         "User-Agent": UA,
         Cookie: `auth_token=${authToken}; ct0=${ct0}`,
         "X-Csrf-Token": ct0,
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        Accept: "text/html,application/xhtml+xml,*/*",
         "Accept-Language": "en-US,en;q=0.5",
-        Referer: "https://twitter.com/",
+        Referer: "https://x.com/",
       },
       redirect: "manual",
     });
@@ -192,49 +157,60 @@ async function connectX(account) {
     let callbackUrl = twitterRes.headers.get("location");
 
     if (!callbackUrl) {
-      const twitterBody = await twitterRes.text().catch(() => "");
-      log(`Akun #${index} — Twitter status: ${twitterRes.status} | body: ${twitterBody.slice(0, 400)}`, "warn");
+      const body = await twitterRes.text().catch(() => "");
+      log(`Akun #${index} — Twitter status: ${twitterRes.status} | body: ${body.slice(0, 400)}`, "warn");
       throw new Error("Tidak ada callback redirect dari Twitter/X");
     }
 
-    // Kalau callback URL relative, tambah base Twitter
-    if (callbackUrl.startsWith("/")) {
-      callbackUrl = `https://twitter.com${callbackUrl}`;
-    }
+    if (callbackUrl.startsWith("/")) callbackUrl = `https://x.com${callbackUrl}`;
 
     log(`Akun #${index} — callback: ${callbackUrl.slice(0, 100)}...`);
 
-    // ── Step 4: Follow callback ke FansZN ─────────────────────────────────────
+    // ── Step 3: Follow callback → FansZN /auth/handle ────────────────────────
     const callbackRes = await fetch(callbackUrl, {
       method: "GET",
       headers: {
         "User-Agent": UA,
-        Cookie: fansCookies,
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        Referer: "https://twitter.com/",
+        Cookie: jar,
+        Accept: "text/html,application/xhtml+xml,*/*",
+        Referer: "https://x.com/",
       },
       redirect: "follow",
     });
 
-    const callbackBody = await callbackRes.text().catch(() => "");
-    const finalUrl = callbackRes.url;
+    setCookies(callbackRes);
+
+    const finalUrl  = callbackRes.url;
+    const finalBody = await callbackRes.text().catch(() => "");
 
     log(`Akun #${index} — final URL: ${finalUrl}`);
 
-    const success =
-      finalUrl.includes("fanszn") ||
-      callbackBody.toLowerCase().includes("fan card") ||
-      callbackBody.toLowerCase().includes("pick your fandom") ||
-      callbackBody.toLowerCase().includes("step 2") ||
-      callbackRes.ok;
+    // ── Step 4: Verifikasi session via /api/fanszn/me ─────────────────────────
+    const meRes  = await fetch(`${BASE}/api/fanszn/me`, {
+      method: "GET",
+      headers: {
+        "User-Agent": UA,
+        Accept: "application/json",
+        Cookie: jar,
+        Referer: `${BASE}/fanszn/connect`,
+      },
+    });
+    const meData = await meRes.json().catch(() => null);
 
-    if (success) {
-      log(`Akun #${index} — ✓ X berhasil di-connect!`, "ok");
-      return { index, status: "ok" };
-    } else {
-      log(`Akun #${index} — final status: ${callbackRes.status} | preview: ${callbackBody.slice(0, 200)}`, "warn");
-      return { index, status: "unknown", detail: `status ${callbackRes.status}` };
+    if (meRes.ok && meData?.success !== false) {
+      const handle = meData?.me?.handle || meData?.handle || "?";
+      log(`Akun #${index} — ✓ Connected! (@${handle})`, "ok");
+      return { index, status: "ok", handle };
     }
+
+    // Fallback cek dari final URL
+    if (finalUrl.includes("/fanszn/connect") || finalUrl.includes("/fanszn/hub") || finalUrl.includes("/fanszn/pick")) {
+      log(`Akun #${index} — ✓ Redirect ke FansZN (session OK)`, "ok");
+      return { index, status: "ok" };
+    }
+
+    log(`Akun #${index} — me status: ${meRes.status} | ${JSON.stringify(meData)?.slice(0, 150)}`, "warn");
+    return { index, status: "unknown", detail: `me=${meRes.status}` };
 
   } catch (err) {
     log(`Akun #${index} — ERROR: ${err.message}`, "err");
