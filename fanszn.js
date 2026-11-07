@@ -3,9 +3,11 @@ const https    = require("https");
 const readline = require("readline");
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
-const ACCTS_FILE = "akun.txt";
-const REF        = "FAN-3CVF";
-const BASE_FANSZN = "fanszn.ipx.exchange";
+const ACCTS_FILE  = "akun.txt";
+const REF         = "FAN-3CVF";
+const FANDOM_ID   = "metal";           // genre default, bisa diganti
+const FOLLOW_USER = "IPXExchange";
+const BASE        = "fanszn.ipx.exchange";
 const BASE_X      = "x.com";
 const BASE_X_API  = "api.x.com";
 const DELAY_MS    = 3000;
@@ -59,6 +61,25 @@ function xHeaders(authToken, ct0, extra = {}) {
   };
 }
 
+function fansznHeaders(sessionCookie, extra = {}) {
+  return {
+    "user-agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+    accept: "*/*",
+    "accept-encoding": "gzip, deflate, br, zstd",
+    "accept-language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+    "content-type": "application/json",
+    cookie: sessionCookie,
+    origin: "https://fanszn.ipx.exchange",
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin",
+    "sec-ch-ua": '"Mises";v="141", "Not?A_Brand";v="8", "Chromium";v="141"',
+    "sec-ch-ua-mobile": "?1",
+    "sec-ch-ua-platform": '"Android"',
+    ...extra,
+  };
+}
+
 function loadAccounts() {
   if (!fs.existsSync(ACCTS_FILE)) { console.error(`${ACCTS_FILE} tidak ditemukan!`); process.exit(1); }
   return fs.readFileSync(ACCTS_FILE, "utf8")
@@ -69,141 +90,297 @@ function loadAccounts() {
     }).filter(a => a.authToken && a.ct0);
 }
 
-// ─── CORE: CONNECT X ──────────────────────────────────────────────────────────
-async function connectX(account) {
+// ─── TWITTER: CEK & FOLLOW ────────────────────────────────────────────────────
+async function checkFollowing(authToken, ct0) {
+  const res = await request({
+    hostname: BASE_X_API,
+    path: `/1.1/friendships/show.json?source_screen_name=me&target_screen_name=${FOLLOW_USER}`,
+    method: "GET",
+    headers: xHeaders(authToken, ct0),
+  });
+  return res.body?.relationship?.source?.following === true;
+}
+
+async function followUser(authToken, ct0) {
+  const body = `screen_name=${FOLLOW_USER}&skip_status=true`;
+  const res = await request({
+    hostname: BASE_X_API,
+    path: "/1.1/friendships/create.json",
+    method: "POST",
+    headers: xHeaders(authToken, ct0, {
+      "content-type": "application/x-www-form-urlencoded",
+      "content-length": Buffer.byteLength(body),
+    }),
+  }, body);
+  return res.status === 200;
+}
+
+// ─── FANSZN: CONNECT X (OAuth2 PKCE) ─────────────────────────────────────────
+async function connectX(authToken, ct0, index) {
+  // Step 1: GET auth/x/start → redirect ke Twitter
+  const startRes = await request({
+    hostname: BASE,
+    path: `/api/fanszn/auth/x/start?returnTo=%2Ffanszn%2Fconnect&ref=${REF}`,
+    method: "GET",
+    headers: {
+      accept: "*/*",
+      "user-agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+      referer: `https://${BASE}/fanszn/pick?ref=${REF}`,
+    },
+  });
+
+  let xAuthUrl = startRes.headers?.location;
+  if (!xAuthUrl) throw new Error(`auth/x/start gagal (${startRes.status}): ${JSON.stringify(startRes.body)?.slice(0,100)}`);
+  xAuthUrl = xAuthUrl.replace("https://twitter.com/", "https://x.com/");
+
+  const urlObj = new URL(xAuthUrl);
+  const state  = urlObj.searchParams.get("state");
+  log(`Akun #${index} — Twitter URL ok, state: ${state?.slice(0,20)}...`);
+
+  // Step 2: GET /i/api/2/oauth2/authorize → dapat auth_code (JSON)
+  const getRes = await request({
+    hostname: BASE_X,
+    path: `/i/api/2/oauth2/authorize?${urlObj.searchParams.toString()}`,
+    method: "GET",
+    headers: xHeaders(authToken, ct0, {
+      accept: "application/json",
+      "sec-fetch-dest": "empty",
+      "sec-fetch-mode": "cors",
+      "sec-fetch-site": "same-origin",
+    }),
+  });
+
+  const authCode = getRes.body?.auth_code;
+  if (!authCode) throw new Error(`Tidak dapat auth_code (${getRes.status}): ${JSON.stringify(getRes.body)?.slice(0,150)}`);
+  log(`Akun #${index} — auth_code ok`);
+
+  // Step 3: POST api.x.com/2/oauth2/authorize → dapat redirect_uri
+  const approveBody = new URLSearchParams({
+    approval:     "true",
+    code:         authCode,
+    consent_flow: "web_consent",
+  }).toString();
+
+  const approveRes = await request({
+    hostname: BASE_X_API,
+    path: "/2/oauth2/authorize",
+    method: "POST",
+    headers: xHeaders(authToken, ct0, {
+      "content-type": "application/x-www-form-urlencoded",
+      "content-length": Buffer.byteLength(approveBody),
+    }),
+  }, approveBody);
+
+  const redirectUri = approveRes.body?.redirect_uri;
+  if (!redirectUri) throw new Error(`Tidak dapat redirect_uri (${approveRes.status}): ${JSON.stringify(approveRes.body)?.slice(0,150)}`);
+
+  const oauthCode = new URL(redirectUri).searchParams.get("code");
+  if (!oauthCode) throw new Error("Tidak ada code di redirect_uri");
+  log(`Akun #${index} — oauth code ok`);
+
+  // Step 4: GET /api/fanszn/auth/x/callback → dapat session cookie
+  const cbState = new URL(redirectUri).searchParams.get("state") || state;
+  const cbRes = await request({
+    hostname: BASE,
+    path: `/api/fanszn/auth/x/callback?state=${encodeURIComponent(cbState)}&code=${encodeURIComponent(oauthCode)}`,
+    method: "GET",
+    headers: {
+      accept: "*/*",
+      "user-agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+      referer: "https://x.com/",
+    },
+  });
+
+  // Extract session cookies
+  const rawCookies = [].concat(cbRes.headers?.["set-cookie"] || []);
+  const sessionCookie = rawCookies.map(c => c.split(";")[0]).join("; ");
+
+  if (!sessionCookie) throw new Error(`Callback tidak return cookie (${cbRes.status})`);
+  log(`Akun #${index} — session cookie ok`);
+
+  return sessionCookie;
+}
+
+// ─── FANSZN: CEK ME ───────────────────────────────────────────────────────────
+async function getMe(sessionCookie) {
+  const res = await request({
+    hostname: BASE,
+    path: "/api/fanszn/me",
+    method: "GET",
+    headers: fansznHeaders(sessionCookie, { referer: `https://${BASE}/fanszn/connect` }),
+  });
+  return res.body;
+}
+
+// ─── FANSZN: PILIH FANDOM ─────────────────────────────────────────────────────
+async function pickFandom(sessionCookie, fandomId = FANDOM_ID) {
+  const body = JSON.stringify({ fandomId });
+  const res = await request({
+    hostname: BASE,
+    path: "/api/fanszn/fandom",
+    method: "POST",
+    headers: fansznHeaders(sessionCookie, {
+      "content-length": Buffer.byteLength(body),
+      referer: `https://${BASE}/fanszn/pick?connected=1&new=1`,
+    }),
+  }, body);
+  return res.status === 200 && res.body?.success;
+}
+
+// ─── FANSZN: FOLLOW X ─────────────────────────────────────────────────────────
+async function fansznFollow(sessionCookie) {
+  const res = await request({
+    hostname: BASE,
+    path: "/api/fanszn/follow",
+    method: "GET",
+    headers: fansznHeaders(sessionCookie, { referer: `https://${BASE}/fanszn/connect` }),
+  });
+  return res.status === 200;
+}
+
+// ─── FANSZN: QUIZ (FAN CHECK) ─────────────────────────────────────────────────
+async function doFanCheck(sessionCookie, index) {
+  // Start quiz
+  const startBody = JSON.stringify({ action: "start" });
+  const startRes = await request({
+    hostname: BASE,
+    path: "/api/fanszn/check",
+    method: "POST",
+    headers: fansznHeaders(sessionCookie, {
+      "content-length": Buffer.byteLength(startBody),
+      referer: `https://${BASE}/fanszn/check?start=1`,
+    }),
+  }, startBody);
+
+  if (!startRes.body?.success) {
+    log(`Akun #${index} — check start: ${JSON.stringify(startRes.body)?.slice(0,100)}`, "warn");
+    return false;
+  }
+
+  const total = startRes.body?.attempt?.total || 7;
+  log(`Akun #${index} — quiz start, total: ${total} soal`);
+
+  // Jawab tiap soal — jawab random, yang penting submit semua
+  for (let i = 0; i < total; i++) {
+    await sleep(Math.floor(Math.random() * 3000) + 2000); // simulate reading time 2-5s
+
+    // Ambil jawaban yg benar dari response sebelumnya kalau ada
+    // kalau ga ada, random pilih 0-3
+    const chosen = Math.floor(Math.random() * 4);
+
+    const ansBody = JSON.stringify({ action: "answer", index: i, chosen });
+    const ansRes = await request({
+      hostname: BASE,
+      path: "/api/fanszn/check",
+      method: "POST",
+      headers: fansznHeaders(sessionCookie, {
+        "content-length": Buffer.byteLength(ansBody),
+        referer: `https://${BASE}/fanszn/check?start=1`,
+      }),
+    }, ansBody);
+
+    const finished = ansRes.body?.attempt?.finished;
+    const correct  = ansRes.body?.attempt?.correct ?? "?";
+    const aura     = ansRes.body?.attempt?.baseAura ?? "?";
+    log(`Akun #${index} — soal ${i+1}/${total} → chosen:${chosen} | correct:${correct} aura:${aura}`);
+
+    if (finished) {
+      log(`Akun #${index} — quiz selesai!`);
+      break;
+    }
+  }
+
+  return true;
+}
+
+// ─── FANSZN: GET CARD ─────────────────────────────────────────────────────────
+async function getCard(sessionCookie) {
+  const res = await request({
+    hostname: BASE,
+    path: "/api/fanszn/card",
+    method: "GET",
+    headers: fansznHeaders(sessionCookie, { referer: `https://${BASE}/fanszn/card?fresh=1` }),
+  });
+  return res.body;
+}
+
+// ─── FANSZN: CHECK IN ─────────────────────────────────────────────────────────
+async function checkIn(sessionCookie) {
+  const res = await request({
+    hostname: BASE,
+    path: "/api/fanszn/checkin",
+    method: "POST",
+    headers: fansznHeaders(sessionCookie, {
+      "content-length": "0",
+      referer: `https://${BASE}/fanszn/hub`,
+    }),
+  }, "");
+  return res.body?.success === true;
+}
+
+// ─── PROCESS 1 AKUN ───────────────────────────────────────────────────────────
+async function processAccount(account) {
   const { authToken, ct0, index } = account;
+  log(`\n${"─".repeat(45)}`);
   log(`Akun #${index} — mulai...`);
 
   try {
-    // ── Step 1: GET /api/fanszn/auth/x/start → dapat redirect ke Twitter ─────
-    const startRes = await request({
-      hostname: BASE_FANSZN,
-      path: `/api/fanszn/auth/x/start?returnTo=%2Ffanszn%2Fconnect&ref=${REF}`,
-      method: "GET",
-      headers: {
-        accept: "*/*",
-        "user-agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
-        referer: `https://${BASE_FANSZN}/fanszn/pick?ref=${REF}`,
-      },
-    });
-
-    // Follow redirect manual (301 twitter.com → x.com)
-    let xAuthUrl = startRes.headers?.location;
-    if (!xAuthUrl) {
-      log(`Akun #${index} — start status: ${startRes.status} | ${JSON.stringify(startRes.body)?.slice(0,200)}`, "warn");
-      throw new Error("Tidak dapat redirect dari auth/x/start");
+    // 1. Twitter follow (pakai xHeaders langsung, tanpa fanszn session)
+    log(`Akun #${index} — cek follow @${FOLLOW_USER}...`);
+    const alreadyFollow = await checkFollowing(authToken, ct0).catch(() => false);
+    if (alreadyFollow) {
+      log(`Akun #${index} — sudah follow @${FOLLOW_USER}`, "warn");
+    } else {
+      const followed = await followUser(authToken, ct0);
+      log(`Akun #${index} — follow @${FOLLOW_USER}: ${followed ? "✓" : "gagal"}`, followed ? "ok" : "warn");
+      await sleep(1500);
     }
 
-    // Kalau masih twitter.com, resolve ke x.com
-    xAuthUrl = xAuthUrl.replace("https://twitter.com/", "https://x.com/");
-    log(`Akun #${index} — Twitter URL: ${xAuthUrl.slice(0, 70)}...`);
+    // 2. Connect X → dapat session cookie
+    log(`Akun #${index} — connect X...`);
+    const sessionCookie = await connectX(authToken, ct0, index);
+    await sleep(1000);
 
-    const urlObj = new URL(xAuthUrl);
-    const state  = urlObj.searchParams.get("state");
+    // 3. Cek me
+    const me = await getMe(sessionCookie);
+    const handle = me?.me?.handle || me?.handle;
+    if (handle) log(`Akun #${index} — logged in as @${handle}`, "ok");
+    else log(`Akun #${index} — me: ${JSON.stringify(me)?.slice(0,100)}`, "warn");
 
-    // ── Step 2: GET /i/api/2/oauth2/authorize → dapat auth_code (JSON) ───────
-    // KEY INSIGHT dari aka.js: path-nya /i/api/2/ bukan /i/
-    const getRes = await request({
-      hostname: BASE_X,
-      path: `/i/api/2/oauth2/authorize?${urlObj.searchParams.toString()}`,
-      method: "GET",
-      headers: xHeaders(authToken, ct0, {
-        accept: "application/json",
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-origin",
-      }),
-    });
+    // 4. Pilih fandom
+    log(`Akun #${index} — pilih fandom: ${FANDOM_ID}...`);
+    const fandomOk = await pickFandom(sessionCookie);
+    log(`Akun #${index} — fandom: ${fandomOk ? "✓" : "gagal/sudah dipilih"}`, fandomOk ? "ok" : "warn");
+    await sleep(1000);
 
-    log(`Akun #${index} — GET oauth2 [${getRes.status}]: ${JSON.stringify(getRes.body)?.slice(0, 200)}`);
+    // 5. FansZN follow (trigger endpoint /api/fanszn/follow)
+    log(`Akun #${index} — fanszn follow trigger...`);
+    await fansznFollow(sessionCookie);
+    await sleep(1000);
 
-    const authCode = getRes.body?.auth_code;
-    if (!authCode) {
-      throw new Error(`Tidak dapat auth_code (status=${getRes.status})`);
+    // 6. Fan check (quiz 7 soal)
+    log(`Akun #${index} — mulai fan check quiz...`);
+    await doFanCheck(sessionCookie, index);
+    await sleep(1500);
+
+    // 7. Get card (trigger setelah quiz selesai)
+    const card = await getCard(sessionCookie);
+    if (card?.success) {
+      log(`Akun #${index} — card: aura=${card.card?.aura} rank=${card.card?.rank} fandom=${card.card?.fandom?.name}`, "ok");
     }
-    log(`Akun #${index} — auth_code: ${authCode.slice(0, 20)}...`);
+    await sleep(1000);
 
-    // ── Step 3: POST api.x.com/2/oauth2/authorize → dapat redirect_uri ───────
-    const approveBody = new URLSearchParams({
-      approval:     "true",
-      code:         authCode,
-      consent_flow: "web_consent",
-    }).toString();
+    // 8. Check in
+    log(`Akun #${index} — check in...`);
+    const checkedIn = await checkIn(sessionCookie);
+    log(`Akun #${index} — checkin: ${checkedIn ? "✓" : "gagal/sudah checkin hari ini"}`, checkedIn ? "ok" : "warn");
 
-    const approveRes = await request({
-      hostname: BASE_X_API,
-      path: "/2/oauth2/authorize",
-      method: "POST",
-      headers: xHeaders(authToken, ct0, {
-        "content-type": "application/x-www-form-urlencoded",
-        "content-length": Buffer.byteLength(approveBody),
-      }),
-    }, approveBody);
+    log(`Akun #${index} — ✓ DONE!`, "ok");
+    return { index, status: "ok", handle: handle || "?" };
 
-    log(`Akun #${index} — approve [${approveRes.status}]: ${JSON.stringify(approveRes.body)?.slice(0, 200)}`);
-
-    const redirectUri = approveRes.body?.redirect_uri;
-    if (!redirectUri) {
-      throw new Error(`Tidak dapat redirect_uri (status=${approveRes.status})`);
-    }
-
-    const oauthCode = new URL(redirectUri).searchParams.get("code");
-    if (!oauthCode) throw new Error("Tidak ada code di redirect_uri");
-
-    log(`Akun #${index} — oauth code: ${oauthCode.slice(0, 20)}...`);
-
-    // ── Step 4: GET /api/fanszn/auth/x/callback ───────────────────────────────
-    const cbState = new URL(redirectUri).searchParams.get("state") || state;
-    const cbRes = await request({
-      hostname: BASE_FANSZN,
-      path: `/api/fanszn/auth/x/callback?state=${encodeURIComponent(cbState)}&code=${encodeURIComponent(oauthCode)}`,
-      method: "GET",
-      headers: {
-        accept: "*/*",
-        "user-agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
-        referer: "https://x.com/",
-      },
-    });
-
-    log(`Akun #${index} — callback [${cbRes.status}]: loc=${cbRes.headers?.location?.slice(0,80) || "none"} | body=${JSON.stringify(cbRes.body)?.slice(0,150)}`);
-
-    // Session cookie dari callback
-    const rawCookies = [].concat(cbRes.headers?.["set-cookie"] || []);
-    const sessionCookie = rawCookies.map(c => c.split(";")[0]).join("; ");
-
-    // ── Step 5: Verifikasi via /api/fanszn/me ─────────────────────────────────
-    const meRes = await request({
-      hostname: BASE_FANSZN,
-      path: "/api/fanszn/me",
-      method: "GET",
-      headers: {
-        accept: "application/json",
-        "user-agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
-        cookie: sessionCookie,
-        referer: `https://${BASE_FANSZN}/fanszn/connect`,
-      },
-    });
-
-    log(`Akun #${index} — me [${meRes.status}]: ${JSON.stringify(meRes.body)?.slice(0, 200)}`);
-
-    if (meRes.status === 200 && meRes.body?.success !== false) {
-      const handle = meRes.body?.me?.handle || meRes.body?.handle || "?";
-      log(`Akun #${index} — ✓ Connected! (@${handle})`, "ok");
-      return { index, status: "ok", handle };
-    }
-
-    // Fallback: callback redirect ke fanszn = sukses
-    const loc = cbRes.headers?.location || "";
-    if (loc.includes("fanszn")) {
-      log(`Akun #${index} — ✓ Callback redirect ke FansZN`, "ok");
-      return { index, status: "ok" };
-    }
-
-    return { index, status: "unknown", detail: `me=${meRes.status}` };
-
-  } catch (err) {
-    log(`Akun #${index} — ERROR: ${err.message}`, "err");
-    return { index, status: "err", detail: err.message };
+  } catch (e) {
+    log(`Akun #${index} — ERROR: ${e.message}`, "err");
+    return { index, status: "err", detail: e.message };
   }
 }
 
@@ -213,7 +390,8 @@ async function showMenu(accounts) {
   const ask = (q) => new Promise((res) => rl.question(q, res));
 
   console.log("\n╔══════════════════════════════╗");
-  console.log("║   FansZN — Connect X Bot     ║");
+  console.log("║   FansZN Full Auto Bot       ║");
+  console.log(`║   ref: ${REF}             ║`);
   console.log("╚══════════════════════════════╝");
   console.log(`  Total akun: ${accounts.length}\n`);
   console.log("  [1] 1 Akun");
@@ -254,10 +432,10 @@ async function main() {
 
   const results = [];
   for (let i = 0; i < targets.length; i++) {
-    const result = await connectX(targets[i]);
+    const result = await processAccount(targets[i]);
     results.push(result);
     if (i < targets.length - 1) {
-      const cd = Math.floor(Math.random() * 3000) + DELAY_MS;
+      const cd = Math.floor(Math.random() * 5000) + DELAY_MS;
       log(`Delay ${(cd/1000).toFixed(1)}s...`);
       await sleep(cd);
     }
@@ -266,13 +444,11 @@ async function main() {
   console.log("\n══════════ SUMMARY ══════════");
   const ok  = results.filter(r => r.status === "ok").length;
   const err = results.filter(r => r.status === "err").length;
-  const unk = results.filter(r => r.status === "unknown").length;
   console.log(`  ✓ Berhasil : ${ok}`);
   console.log(`  ✗ Error    : ${err}`);
-  console.log(`  ⚠ Unknown : ${unk}`);
-  if (err || unk) {
+  if (err) {
     results.filter(r => r.status !== "ok")
-      .forEach(r => console.log(`  Akun #${r.index} [${r.status}]: ${r.detail || "-"}`));
+      .forEach(r => console.log(`  Akun #${r.index}: ${r.detail?.slice(0,80) || "-"}`));
   }
   console.log("═════════════════════════════\n");
 }
