@@ -140,7 +140,7 @@ async function connectX(account) {
 
     log(`Akun #${index} — Twitter URL: ${twitterAuthUrl.slice(0, 80)}...`);
 
-    // ── Step 2: GET halaman OAuth Twitter → ambil authenticity_token ─────────
+    // ── Step 2: GET halaman OAuth Twitter, follow redirect sampai dapat form ──
     const twitterHeaders = {
       "User-Agent": UA,
       Cookie: `auth_token=${authToken}; ct0=${ct0}`,
@@ -150,124 +150,100 @@ async function connectX(account) {
       Referer: "https://x.com/",
     };
 
-    const oauthPageRes = await fetch(twitterAuthUrl, {
-      method: "GET",
-      headers: twitterHeaders,
-      redirect: "manual",
-    });
+    // Follow redirect manual sampai dapat halaman yang bukan twitter.com -> x.com redirect
+    // atau sampai dapat callback ke fanszn
+    let currentUrl = twitterAuthUrl;
+    let oauthPageRes, oauthHtml = "", twitterCookies = "";
+    let callbackUrl = null;
 
-    // Kalau langsung redirect (sudah pernah authorize), ikutin
-    let callbackUrl = oauthPageRes.headers.get("location");
-    if (callbackUrl) {
-      log(`Akun #${index} — langsung redirect (sudah authorize sebelumnya)`);
-      if (callbackUrl.startsWith("/")) callbackUrl = `https://x.com${callbackUrl}`;
-    } else {
-      // Perlu parse HTML buat submit form authorize
-      const oauthHtml = await oauthPageRes.text().catch(() => "");
+    for (let hop = 0; hop < 5; hop++) {
+      oauthPageRes = await fetch(currentUrl, {
+        method: "GET",
+        headers: { ...twitterHeaders, Referer: hop === 0 ? `${BASE}/fanszn/pick` : currentUrl },
+        redirect: "manual",
+      });
 
-      // Cari authenticity_token di form
-      const authTokenMatch = oauthHtml.match(/authenticity_token["\s]+value="([^"]+)"/i)
-        || oauthHtml.match(/name="authenticity_token"[^>]+value="([^"]+)"/i)
-        || oauthHtml.match(/"authenticity_token","value","([^"]+)"/i);
+      const loc = oauthPageRes.headers.get("location");
+      const rawCookies = oauthPageRes.headers.getSetCookie?.() ||
+        (oauthPageRes.headers.get("set-cookie") ? [oauthPageRes.headers.get("set-cookie")] : []);
+      if (rawCookies.length) {
+        twitterCookies = mergeCookies(twitterCookies, rawCookies.map(c => c.split(";")[0]).join("; "));
+      }
 
-      // Cari redirect_after_login atau state dari hidden fields
-      const twitterCookies = (() => {
-        const raw = oauthPageRes.headers.getSetCookie?.() ||
-          (oauthPageRes.headers.get("set-cookie") ? [oauthPageRes.headers.get("set-cookie")] : []);
-        return raw.length ? raw.map(c => c.split(";")[0]).join("; ") : "";
-      })();
+      log(`Akun #${index} — hop${hop} [${oauthPageRes.status}] ${currentUrl.slice(0, 60)}... → ${loc ? loc.slice(0, 60) + "..." : "no-redirect"}`);
 
-      if (!authTokenMatch) {
-        // Twitter OAuth2 PKCE: tidak pakai form HTML biasa
-        // Cari endpoint authorize di response
-        log(`Akun #${index} — OAuth2 PKCE flow (status: ${oauthPageRes.status})`);
+      if (!loc) {
+        // Dapat halaman HTML — ini halaman OAuth authorize
+        oauthHtml = await oauthPageRes.text().catch(() => "");
+        break;
+      }
 
-        // Cari data-* atau JSON yang ada di halaman
-        const codeMatch = oauthHtml.match(/"code"\s*:\s*"([^"]+)"/);
-        const authCodeMatch = oauthHtml.match(/authorization_code[=:]([^&"]+)/);
+      const resolvedLoc = loc.startsWith("/") ? `https://x.com${loc}` : loc;
 
-        if (codeMatch || authCodeMatch) {
-          const code = (codeMatch || authCodeMatch)[1];
-          callbackUrl = `https://fanszn.ipx.exchange/api/fanszn/auth/x/callback?code=${code}&state=${encodeURIComponent(new URL(twitterAuthUrl).searchParams.get("state") || "")}`;
-          log(`Akun #${index} — code extracted: ${code.slice(0, 20)}...`);
-        } else {
-          // POST ke Twitter authorize endpoint (OAuth2 PKCE)
-          const state   = new URL(twitterAuthUrl).searchParams.get("state") || "";
-          const authUrl = new URL(twitterAuthUrl);
-          const approveUrl = `https://x.com/i/oauth2/authorize`;
+      // Kalau redirect sudah ke callback FansZN, langsung pakai
+      if (resolvedLoc.includes("fanszn.ipx.exchange")) {
+        callbackUrl = resolvedLoc;
+        log(`Akun #${index} — langsung dapat callback FansZN!`);
+        break;
+      }
 
-          const approveRes = await fetch(approveUrl, {
-            method: "POST",
-            headers: {
-              ...twitterHeaders,
-              "Content-Type": "application/x-www-form-urlencoded",
-              Cookie: `auth_token=${authToken}; ct0=${ct0}; ${twitterCookies}`,
-              "X-Csrf-Token": ct0,
-              Origin: "https://x.com",
-            },
-            body: new URLSearchParams({
-              approval:        "true",
-              code_challenge:  authUrl.searchParams.get("code_challenge")  || "",
-              code_challenge_method: authUrl.searchParams.get("code_challenge_method") || "S256",
-              client_id:       authUrl.searchParams.get("client_id")       || "",
-              redirect_uri:    authUrl.searchParams.get("redirect_uri")    || "",
-              response_type:   "code",
-              scope:           authUrl.searchParams.get("scope")           || "",
-              state,
-            }).toString(),
-            redirect: "manual",
-          });
+      currentUrl = resolvedLoc;
+    }
 
-          callbackUrl = approveRes.headers.get("location");
+    if (!callbackUrl) {
+      // oauthHtml & twitterCookies sudah di-set di dalam loop di atas
+      log(`Akun #${index} — OAuth2 PKCE flow (status: ${oauthPageRes.status})`);
 
-          if (!callbackUrl) {
-            const approveBody = await approveRes.text().catch(() => "");
-            // Coba parse JSON response (Twitter OAuth2 kadang return JSON)
-            try {
-              const j = JSON.parse(approveBody);
-              callbackUrl = j.redirect_uri || j.location || j.url;
-              if (!callbackUrl && j.auth_code) {
-                const state2 = authUrl.searchParams.get("state") || "";
-                const redir  = authUrl.searchParams.get("redirect_uri") || "";
-                callbackUrl = `${redir}?code=${j.auth_code}&state=${encodeURIComponent(state2)}`;
-              }
-            } catch (_) {}
+      // POST approve ke Twitter OAuth2
+      const authUrl = new URL(currentUrl);
+      const state   = authUrl.searchParams.get("state") || "";
 
-            if (!callbackUrl) {
-              log(`Akun #${index} — approve status: ${approveRes.status} | body: ${approveBody.slice(0, 400)}`, "warn");
-              throw new Error("Gagal approve OAuth2 Twitter");
-            }
+      const approveRes = await fetch("https://x.com/i/oauth2/authorize", {
+        method: "POST",
+        headers: {
+          ...twitterHeaders,
+          "Content-Type": "application/x-www-form-urlencoded",
+          Cookie: `auth_token=${authToken}; ct0=${ct0}; ${twitterCookies}`,
+          "X-Csrf-Token": ct0,
+          Origin: "https://x.com",
+          Referer: currentUrl,
+        },
+        body: new URLSearchParams({
+          approval:              "true",
+          code_challenge:        authUrl.searchParams.get("code_challenge")        || "",
+          code_challenge_method: authUrl.searchParams.get("code_challenge_method") || "S256",
+          client_id:             authUrl.searchParams.get("client_id")             || "",
+          redirect_uri:          authUrl.searchParams.get("redirect_uri")          || "",
+          response_type:         "code",
+          scope:                 authUrl.searchParams.get("scope")                 || "",
+          state,
+        }).toString(),
+        redirect: "manual",
+      });
+
+      callbackUrl = approveRes.headers.get("location");
+      log(`Akun #${index} — approve [${approveRes.status}] loc: ${callbackUrl?.slice(0, 80) || "none"}`);
+
+      if (!callbackUrl) {
+        const approveBody = await approveRes.text().catch(() => "");
+        // Twitter OAuth2 kadang return JSON dengan redirect_uri atau auth_code
+        try {
+          const j = JSON.parse(approveBody);
+          if (j.redirect_uri || j.location || j.url) {
+            callbackUrl = j.redirect_uri || j.location || j.url;
+          } else if (j.auth_code) {
+            const redir = authUrl.searchParams.get("redirect_uri") || "";
+            callbackUrl = `${redir}?code=${j.auth_code}&state=${encodeURIComponent(state)}`;
           }
-        }
-      } else {
-        // OAuth1 flow (form-based)
-        const authenticity_token = authTokenMatch[1];
-        log(`Akun #${index} — authenticity_token: ${authenticity_token.slice(0, 20)}...`);
+        } catch (_) {}
 
-        const approveRes = await fetch("https://api.twitter.com/oauth/authorize", {
-          method: "POST",
-          headers: {
-            ...twitterHeaders,
-            "Content-Type": "application/x-www-form-urlencoded",
-            Cookie: `auth_token=${authToken}; ct0=${ct0}; ${twitterCookies}`,
-            Origin: "https://api.twitter.com",
-          },
-          body: new URLSearchParams({
-            authenticity_token,
-            redirect_after_login: twitterAuthUrl,
-          }).toString(),
-          redirect: "manual",
-        });
-
-        callbackUrl = approveRes.headers.get("location");
         if (!callbackUrl) {
-          const b = await approveRes.text().catch(() => "");
-          log(`Akun #${index} — OAuth1 approve status: ${approveRes.status} | ${b.slice(0, 300)}`, "warn");
-          throw new Error("Gagal submit OAuth1 authorize form");
+          log(`Akun #${index} — approve body: ${approveBody.slice(0, 400)}`, "warn");
+          throw new Error(`Gagal approve OAuth2 Twitter (status ${approveRes.status})`);
         }
       }
 
-      if (callbackUrl?.startsWith("/")) callbackUrl = `https://x.com${callbackUrl}`;
+      if (callbackUrl.startsWith("/")) callbackUrl = `https://x.com${callbackUrl}`;
     }
 
     log(`Akun #${index} — callback: ${callbackUrl?.slice(0, 100)}...`);
