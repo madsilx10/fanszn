@@ -194,6 +194,18 @@ async function connectX(account) {
       // oauthHtml & twitterCookies sudah di-set di dalam loop di atas
       log(`Akun #${index} — OAuth2 PKCE flow (status: ${oauthPageRes.status})`);
 
+      // Debug: scan halaman OAuth buat cari form/api endpoint
+      const pageFormAction  = oauthHtml.match(/action="([^"]+)"/)?.[1];
+      const pageHiddenFields = [...oauthHtml.matchAll(/name="([^"]+)"[^>]*value="([^"]*)"/g)]
+        .map(m => `${m[1]}=${m[2].slice(0,40)}`);
+      const pageScripts = [...oauthHtml.matchAll(/(?:fetch|axios|post)\(['"`](\/[^'"`]+)['"`]/gi)].map(m=>m[1]);
+      const pageApiUrls = [...oauthHtml.matchAll(/"(\/[12][^"]*oauth[^"]*|\/i\/api[^"]+)"/g)].map(m=>m[1]);
+      log(`Akun #${index} — page form action: ${pageFormAction || "none"}`);
+      log(`Akun #${index} — page hidden fields: ${pageHiddenFields.join(" | ") || "none"}`);
+      if (pageScripts.length)  log(`Akun #${index} — page fetches: ${pageScripts.join(" | ")}`);
+      if (pageApiUrls.length)  log(`Akun #${index} — page api urls: ${pageApiUrls.join(" | ")}`);
+      log(`Akun #${index} — page HTML (600): ${oauthHtml.slice(0, 600)}`);
+
       // POST approve ke Twitter OAuth2
       const authUrl = new URL(currentUrl);
       const state   = authUrl.searchParams.get("state") || "";
@@ -241,7 +253,14 @@ async function connectX(account) {
         } catch (_) {}
 
         if (!callbackUrl) {
-          log(`Akun #${index} — approve body (800): ${approveBody.slice(0, 800)}`, "warn");
+          // Print semua hidden input fields dari HTML halaman OAuth
+          const hiddenFields = [...approveBody.matchAll(/name="([^"]+)"[^>]*value="([^"]*)"/g)]
+            .map(m => `${m[1]}=${m[2].slice(0,40)}`);
+          const formAction = approveBody.match(/action="([^"]+)"/)?.[1];
+          const jsApiCalls = [...approveBody.matchAll(/fetch\(['"`]([^'"`]+)['"`]/g)].map(m => m[1]);
+          log(`Akun #${index} — form action: ${formAction || "none"}`, "warn");
+          log(`Akun #${index} — hidden fields: ${hiddenFields.join(" | ") || "none"}`, "warn");
+          log(`Akun #${index} — js fetches: ${jsApiCalls.join(" | ") || "none"}`, "warn");
           throw new Error(`Gagal approve OAuth2 Twitter (status ${approveRes.status})`);
         }
       }
