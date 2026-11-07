@@ -5,6 +5,7 @@ const readline = require("readline");
 const REF_LINK = "https://fanszn.ipx.exchange/i/FAN-3CVF";
 const ACCTS_FILE = "akun.txt";
 const DELAY_MS = 2000; // jeda antar akun (ms)
+const DEBUG = process.argv.includes("--debug");
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 function sleep(ms) {
@@ -41,6 +42,40 @@ function loadAccounts() {
   }
 
   return accounts;
+}
+
+// ─── DEBUG: PROBE ENDPOINTS ───────────────────────────────────────────────────
+async function probeEndpoints() {
+  const BASE = "https://fanszn.ipx.exchange";
+  const UA = "Mozilla/5.0 (Linux; Android 11; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
+
+  const endpoints = [
+    { method: "GET",  url: `${BASE}/api/auth/csrf` },
+    { method: "GET",  url: `${BASE}/fanszn/api/auth/csrf` },
+    { method: "GET",  url: `${BASE}/api/auth/providers` },
+    { method: "GET",  url: `${BASE}/fanszn/api/auth/providers` },
+    { method: "GET",  url: `${BASE}/api/auth/signin` },
+    { method: "GET",  url: `${BASE}/fanszn/api/auth/signin` },
+  ];
+
+  console.log("\n══════ DEBUG PROBE ══════");
+  for (const ep of endpoints) {
+    try {
+      const res = await fetch(ep.url, {
+        method: ep.method,
+        headers: { "User-Agent": UA, Accept: "application/json, text/html, */*" },
+        redirect: "manual",
+      });
+      const body = await res.text().catch(() => "");
+      const loc  = res.headers.get("location") || "";
+      console.log(`\n[${res.status}] ${ep.url}`);
+      if (loc)  console.log(`  → redirect: ${loc}`);
+      if (body) console.log(`  body: ${body.slice(0, 200)}`);
+    } catch (e) {
+      console.log(`\n[ERR] ${ep.url} → ${e.message}`);
+    }
+  }
+  console.log("\n═════════════════════════\n");
 }
 
 // ─── CORE: CONNECT X ──────────────────────────────────────────────────────────
@@ -262,6 +297,11 @@ async function showMenu(accounts) {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
+  if (DEBUG) {
+    await probeEndpoints();
+    process.exit(0);
+  }
+
   const accounts = loadAccounts();
 
   if (accounts.length === 0) {
